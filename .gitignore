@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+.venv/
+venv/
+env/
+
+# Data files (regenerable)
+data/raw/
+data/staging/
+data/clean/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
