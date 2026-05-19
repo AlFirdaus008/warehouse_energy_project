@@ -1,326 +1,963 @@
+# INT24 S1 Sains Data FMIPA UNESA — 2025/2026
+# Tim: Abdullah Al-Firdaus Nuzula, Mylovia Mahesa Ayu,
+#       Fio Ulaa' Octriyanti, Muhammad Raffi Fahrezi
+#
+# Schedule  : setiap 5 menit
+# Server    : airflow.icaiunesa.dev  |  user: inter24
+# DAG path  : /home/inter24/dags/energy_etl_dag.py
+
+from __future__ import annotations
+
+import os
+import logging
 from datetime import datetime, timedelta
-from airflow.decorators import dag, task
-from airflow.operators.bash import BashOperator # type: ignore
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv("/home/inter24/dags/energy_dwh/.env")
+
 import pandas as pd
+import numpy as np
+import requests
+from sqlalchemy import create_engine, text
 
-STAGING  = "/home/inter24/energy_dwh/staging"
-RAW_DIR  = "/home/inter24/energy_dwh/raw"
-EIA_API_KEY= "0aWq1mZQy2eQk9Cg2E9u7F8BrEBovNevmmfxgHKc"
+from airflow.decorators import dag, task
 
-default_args = {
-    "owner"          : "inter24",
-    "depends_on_past": False,
-    "retries"        : 1,
-    "retry_delay"    : timedelta(minutes=5),
+# ---------------------------------------------------------------------------
+# Konfigurasi Path - Fir
+# ---------------------------------------------------------------------------
+BASE_DIR    = Path("/home/inter24/dags/energy_dwh")
+RAW_DIR     = BASE_DIR / "raw"
+STAGING_DIR = Path("/tmp/energy_dwh/staging")
+CLEAN_DIR   = Path("/tmp/energy_dwh/clean")
+
+# ---------------------------------------------------------------------------
+# Konstanta Dataset
+# ---------------------------------------------------------------------------
+EIA_BASE_URL = "https://api.eia.gov/v2"
+TARGET_COUNTRIES = [
+    "United States", "China", "Germany", "Japan",
+    "India", "United Kingdom", "France", "Brazil"
+]
+COUNTRY_CODE_MAP = {
+    "United States": "US", "China": "CN", "Germany": "DE",
+    "Japan": "JP",         "India": "IN", "United Kingdom": "GB",
+    "France": "FR",        "Brazil": "BR"
+}
+FUEL_CATEGORY_MAP = {
+    "COL": ("Coal",          "Fossil",    False),
+    "NG":  ("Natural Gas",   "Fossil",    False),
+    "NUC": ("Nuclear",       "Nuclear",   False),
+    "WND": ("Wind",          "Renewable", True),
+    "SUN": ("Solar",         "Renewable", True),
+    "HYC": ("Hydroelectric", "Renewable", True),
+    "GEO": ("Geothermal",    "Renewable", True),
+    "OTH": ("Other",         "Other",     False),
 }
 
+log = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# DAG Definition
+# ===========================================================================
 @dag(
-    dag_id      = "energy_economy_etl_int24",
-    description = "ETL pipeline - U.S. Electricity & Global Economic Indicators 2022-2024",
-    default_args= default_args,
-    schedule    = None,
-    start_date  = datetime(2022, 1, 1),
-    catchup     = False,
-    tags        = ["etl", "inter24", "energy", "economics"],
+    dag_id="energy_economy_etl",
+    description=(
+        "ETL Pipeline: EIA Electricity API + World Bank CSV → "
+        "Transform Star Schema → Load Supabase PostgreSQL"
+    ),
+    schedule=timedelta(minutes=5),
+    start_date=datetime(2025, 5, 19),
+    catchup=False,
+    max_active_runs=1,
+    default_args={
+        "retries": 2,
+        "retry_delay": timedelta(minutes=1),
+        "owner": "inter24",
+    },
+    tags=["energy", "worldbank", "eia", "supabase", "int24"],
 )
-def energy_economy_pipeline():
+def energy_economy_etl():
+    """
+    Alur:
+      extract_eia_retail
+      extract_eia_gen
+      extract_worldbank
 
-    # ══════════════════════════════════════
-    # EXTRACT 1 — EIA Retail
-    # ══════════════════════════════════════
-    @task()
-    def extract_eia() -> str:
-        import requests, os, pandas as pd
+      transform_all
 
-        API_KEY = EIA_API_KEY
-        os.makedirs(STAGING, exist_ok=True)
+      load to supabase
 
-        url    = "  "
+      refresh views
+    """
+
+    # =======================================================================
+    # TASK 1A — EXTRACT: EIA Retail Sales & Price
+    # =======================================================================
+    @task(task_id="extract_eia_retail")
+    def extract_eia_retail() -> str:
+        """
+        Hit EIA API v2 endpoint retail-sales.
+        Ambil kolom: period, stateid, sectorid, sectorName,
+                     sales (MWh), price (cents/kWh), revenue (juta USD).
+        Simpan ke staging/eia_retail_2022_2024.csv
+        Return: path file output
+        """
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
+        api_key = os.environ.get("EIA_API_KEY", "")
+        if not api_key:
+            raise EnvironmentError("EIA_API_KEY tidak ditemukan di environment.")
+
+        url = f"{EIA_BASE_URL}/electricity/retail-sales/data"
         params = {
-            "api_key"            : API_KEY,
-            "frequency"          : "monthly",
-            "data[0]"            : "sales",
-            "data[1]"            : "price",
-            "data[2]"            : "revenue",
-            "facets[stateid][]"  : "US",
-            "facets[sectorid][]" : ["RES", "COM", "IND", "ALL"],
-            "start"              : "2022-01",
-            "end"                : "2024-12",
-            "length"             : 5000,
+            "api_key":             api_key,
+            "frequency":           "monthly",
+            "data[0]":             "sales",
+            "data[1]":             "price",
+            "data[2]":             "revenue",
+            "facets[stateid][]":   "US",
+            "facets[sectorid][]":  ["RES", "COM", "IND", "ALL"],
+            "start":               "2022-01",
+            "end":                 "2024-12",
+            "sort[0][column]":     "period",
+            "sort[0][direction]":  "asc",
+            "offset":              0,
+            "length":              5000,
         }
 
-        resp = requests.get(url, params=params, timeout=60)
-        resp.raise_for_status()
-        records = resp.json().get("response", {}).get("data", [])
+        all_records = []
+        while True:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            body    = resp.json().get("response", {})
+            records = body.get("data", [])
+            total   = int(body.get("total", 0))
 
-        out = f"{STAGING}/eia_retail.csv"
-        pd.DataFrame(records).to_csv(out, index=False)
-        print(f"EIA retail: {len(records)} records → {out}")
-        return out
+            if not records:
+                log.warning("EIA Retail: tidak ada data. Cek API key / endpoint.")
+                break
 
-    # ══════════════════════════════════════
-    # EXTRACT 2 — EIA Generation
-    # ══════════════════════════════════════
-    @task()
+            all_records.extend(records)
+            log.info("EIA Retail: %d / %d records", len(all_records), total)
+
+            if len(all_records) >= total:
+                break
+            params["offset"] += params["length"]
+
+        df = pd.DataFrame(all_records)
+        out_path = str(STAGING_DIR / "eia_retail_2022_2024.csv")
+        df.to_csv(out_path, index=False)
+        log.info("✓ EIA Retail disimpan → %s  shape=%s", out_path, df.shape)
+        return out_path
+
+    # =======================================================================
+    # TASK 1B — EXTRACT: EIA Net Generation by Fuel Type
+    # =======================================================================
+    @task(task_id="extract_eia_generation")
     def extract_eia_generation() -> str:
-        import requests, os, pandas as pdq
+        """
+        Hit EIA API v2 endpoint electric-power-operational-data.
+        Ambil generasi per fuel type untuk US, Jan 2022 – Des 2024.
+        Simpan ke staging/eia_generation_2022_2024.csv
+        """
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
-        API_KEY = EIA_API_KEY
-        os.makedirs(STAGING, exist_ok=True)
+        api_key = os.environ.get("EIA_API_KEY", "")
+        if not api_key:
+            raise EnvironmentError("EIA_API_KEY tidak ditemukan di environment.")
 
-        url    = "https://api.eia.gov/v2/electricity/electric-power-operational-data/data"
+        url = f"{EIA_BASE_URL}/electricity/electric-power-operational-data/data"
         params = {
-            "api_key"              : API_KEY,
-            "frequency"            : "monthly",
-            "data[0]"              : "generation",
-            "facets[location][]"   : "US",
-            "facets[fueltypeid][]" : ["COL", "NG", "NUC", "WND", "SUN", "HYC"],
-            "start"                : "2022-01",
-            "end"                  : "2024-12",
-            "length"               : 5000,
+            "api_key":               api_key,
+            "frequency":             "monthly",
+            "data[0]":               "generation",
+            "facets[location][]":    "US",
+            "facets[fueltypeid][]":  ["COL", "NG", "NUC", "WND",
+                                      "SUN", "HYC", "GEO", "OTH"],
+            "start":                 "2022-01",
+            "end":                   "2024-12",
+            "sort[0][column]":       "period",
+            "sort[0][direction]":    "asc",
+            "offset":                0,
+            "length":                5000,
         }
 
-        # BUG 5 FIX: raise_for_status + timeout
-        resp = requests.get(url, params=params, timeout=60)
-        resp.raise_for_status()
-        records = resp.json().get("response", {}).get("data", [])
+        all_records = []
+        while True:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            body    = resp.json().get("response", {})
+            records = body.get("data", [])
+            total   = int(body.get("total", 0))
 
-        out = f"{STAGING}/eia_generation.csv"
-        pd.DataFrame(records).to_csv(out, index=False)
-        print(f"EIA generation: {len(records)} records → {out}")
-        return out
+            if not records:
+                log.warning("EIA Generation: tidak ada data.")
+                break
 
-    # ══════════════════════════════════════
-    # EXTRACT 3 — World Bank CSV
-    # ══════════════════════════════════════
-    @task()
+            all_records.extend(records)
+            log.info("EIA Generation: %d / %d records", len(all_records), total)
+
+            if len(all_records) >= total:
+                break
+            params["offset"] += params["length"]
+
+        df = pd.DataFrame(all_records)
+        out_path = str(STAGING_DIR / "eia_generation_2022_2024.csv")
+        df.to_csv(out_path, index=False)
+        log.info("✓ EIA Generation disimpan → %s  shape=%s", out_path, df.shape)
+        return out_path
+
+    # =======================================================================
+    # TASK 1C — EXTRACT: World Bank CSV
+    # =======================================================================
+    @task(task_id="extract_worldbank")
     def extract_worldbank() -> str:
-        import pandas as pd, os
-        from functools import reduce
+        """
+        5 file CSV World Bank dari /home/inter24/dags/energy_dwh/raw/.
+        Nama file :
+          - wb_cpi.csv
+          - wb_gdp.csv
+          - wb_industrial.csv
+          - wb_unemployment.csv
+          - wb_exchange_rate.csv
 
-        os.makedirs(STAGING, exist_ok=True)
+        Format kolom CSV (wide format):
+          period_raw, United States, China, Germany, Japan,
+          India, United Kingdom, France, Brazil
 
-        files = {
-            "wb_cpi.csv"          : "cpi_pct_yoy",
-            "wb_gdp.csv"          : "gdp_current_usd_mn",
-            "wb_industrial.csv"   : "industrial_prod_usd",
-            "wb_unemployment.csv" : "unemployment_rate",
-            "wb_exchange_rate.csv": "exchange_rate_lcu_usd",
+        Format period_raw:
+          - Bulanan: 2022M01
+          - Tahunan: 2022.0  (hanya GDP)
+
+        Output: 5 file long-format di staging/wb_*.csv
+        """
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
+        file_map = {
+            "cpi":           "wb_cpi.csv",
+            "gdp":           "wb_gdp.csv",
+            "industrial":    "wb_industrial.csv",
+            "unemployment":  "wb_unemployment.csv",
+            "exchange_rate": "wb_exchange_rate.csv",
         }
 
-        dfs = []
-        for fname, indicator in files.items():
-            fpath = os.path.join(RAW_DIR, fname)
-            if os.path.exists(fpath):
-                df = pd.read_csv(fpath)
-                print(f"{fname}: {df.shape} | kolom: {df.columns.tolist()}")
-                dfs.append(df)
-            else:
-                print(f"Tidak ditemukan: {fpath}")
+        saved_files = []
 
-        if dfs:
-            df_all = reduce(
-                lambda l, r: pd.merge(l, r, on=["period_raw", "country"], how="outer"),
-                dfs
-            )
-            out = f"{STAGING}/wb_combined.csv"
-            df_all.to_csv(out, index=False)
-            print(f"World Bank combined: {df_all.shape} → {out}")
-            return out
-        else:
-            print("Tidak ada file World Bank ditemukan")
-            return ""
-
-    # ══════════════════════════════════════
-    # TRANSFORM
-    # ══════════════════════════════════════
-    @task()
-    def transform(retail_path: str, gen_path: str, wb_path: str) -> dict:
-        import pandas as pd
-        import os
-
-        print("=" * 50)
-        print("TRANSFORM — mulai")
-        print("=" * 50)
-
-        clean_dir = f"{STAGING}/clean"
-        os.makedirs(clean_dir, exist_ok=True)
-
-        def normalize_period(p):
-            p = str(p).strip()
-            if "M" in p:
-                parts = p.split("M")
-                return f"{parts[0]}-{parts[1].zfill(2)}"
-            if len(p) == 7 and "-" in p:
-                return p
-            return None
-
-        df_retail = pd.DataFrame()
-        df_gen    = pd.DataFrame()
-
-        # ── A. Transform EIA Retail ───────────
-        print(f"\nMembaca: {retail_path}")
-        df_retail = pd.read_csv(retail_path)
-        print(f"EIA retail raw: {df_retail.shape} | kolom: {df_retail.columns.tolist()}")
-
-        if not df_retail.empty:
-            df_retail.columns = [c.lower().strip() for c in df_retail.columns]
-            rename_map = {
-                "stateid"   : "state_id",
-                "sectorid"  : "sector_id",
-                "sectorname": "sector_name",
-                "sales"     : "retail_sales_mwh",
-                "price"     : "price_cents_kwh",
-                "revenue"   : "revenue_million_usd",
-            }
-            df_retail = df_retail.rename(columns=rename_map)
-            if "state_id" in df_retail.columns:
-                df_retail = df_retail[df_retail["state_id"] == "US"].copy()
-            for col in ["retail_sales_mwh", "price_cents_kwh", "revenue_million_usd"]:
-                if col in df_retail.columns:
-                    df_retail[col] = pd.to_numeric(df_retail[col], errors="coerce")
-            df_retail["period_dt"] = pd.to_datetime(df_retail["period"], format="%Y-%m", errors="coerce")
-            df_retail["year"]    = df_retail["period_dt"].dt.year
-            df_retail["month"]   = df_retail["period_dt"].dt.month
-            df_retail["quarter"] = df_retail["period_dt"].dt.quarter
-            df_retail = df_retail.drop_duplicates().reset_index(drop=True)
-
-            out_retail = f"{clean_dir}/fact_retail.csv"
-            df_retail.to_csv(out_retail, index=False)
-            print(f"EIA retail clean: {df_retail.shape} → {out_retail}")
-
-        # ── B. Transform EIA Generation ───────
-        print(f"\nMembaca: {gen_path}")
-        df_gen = pd.read_csv(gen_path)
-        print(f"EIA generation raw: {df_gen.shape} | kolom: {df_gen.columns.tolist()}")
-
-        if not df_gen.empty:
-            df_gen.columns = [c.lower().strip() for c in df_gen.columns]
-            fuel_col = next((c for c in df_gen.columns if "fuel" in c and "id" in c), None)
-            if fuel_col and fuel_col != "fuel_type_id":
-                df_gen = df_gen.rename(columns={fuel_col: "fuel_type_id"})
-            df_gen = df_gen.rename(columns={"generation": "net_generation_mwh"})
-            df_gen["net_generation_mwh"] = pd.to_numeric(df_gen["net_generation_mwh"], errors="coerce")
-            df_gen = df_gen.dropna(subset=["net_generation_mwh"])
-            df_gen = df_gen[df_gen["net_generation_mwh"] >= 0]
-
-            fuel_map  = {"COL": "Coal", "NG": "Natural Gas", "NUC": "Nuclear",
-                         "WND": "Wind", "SUN": "Solar", "HYC": "Hydroelectric",
-                         "GEO": "Geothermal", "OTH": "Other"}
-            renewable = ["WND", "SUN", "HYC", "GEO", "WAS", "BIO"]
-            fossil    = ["COL", "NG", "PET", "OOG"]
-
-            if "fuel_type_id" in df_gen.columns:
-                df_gen["fuel_name"]     = df_gen["fuel_type_id"].map(fuel_map).fillna("Other")
-                df_gen["fuel_category"] = df_gen["fuel_type_id"].apply(
-                    lambda x: "Fossil" if x in fossil
-                    else "Renewable" if x in renewable
-                    else "Nuclear" if x == "NUC" else "Other"
+        for indicator, filename in file_map.items():
+            src = RAW_DIR / filename
+            if not src.exists():
+                raise FileNotFoundError(
+                    f"File tidak ditemukan: {src}\n"
+                    f"Pastikan sudah di-scp ke server dengan:\n"
+                    f"  scp {filename} inter24@178.128.52.238:"
+                    f"/home/inter24/dags/energy_dwh/raw/"
                 )
-                df_gen["is_renewable"] = df_gen["fuel_type_id"].isin(renewable)
 
-            df_gen["period_dt"] = pd.to_datetime(df_gen["period"], format="%Y-%m", errors="coerce")
-            df_gen["year"]    = df_gen["period_dt"].dt.year
-            df_gen["month"]   = df_gen["period_dt"].dt.month
-            df_gen["quarter"] = df_gen["period_dt"].dt.quarter
-            df_gen = df_gen.drop_duplicates().reset_index(drop=True)
+            df_wide = pd.read_csv(src)
+            df_wide.columns = [c.strip() for c in df_wide.columns]
 
-            out_gen = f"{clean_dir}/fact_generation.csv"
-            df_gen.to_csv(out_gen, index=False)
-            print(f"EIA generation clean: {df_gen.shape} → {out_gen}")
+            # Pilih hanya kolom negara target yang ada
+            country_cols = [c for c in TARGET_COUNTRIES if c in df_wide.columns]
+            df_wide = df_wide[["period_raw"] + country_cols].copy()
 
-        # ── C. Transform World Bank ───────────
-        if wb_path and os.path.exists(wb_path):
-            print(f"\nMembaca: {wb_path}")
-            df_wb = pd.read_csv(wb_path)
-            df_wb["period"] = df_wb["period_raw"].apply(normalize_period)
-            df_wb = df_wb.dropna(subset=["period"])
-            df_wb = df_wb[df_wb["period"].str.startswith(("2022", "2023", "2024"))]
-            indicator_cols = [c for c in df_wb.columns if c not in ["period_raw", "period", "country"]]
-            for col in indicator_cols:
-                df_wb[col] = pd.to_numeric(df_wb[col], errors="coerce")
-            df_wb["period_dt"] = pd.to_datetime(df_wb["period"], format="%Y-%m", errors="coerce")
-            df_wb["year"]    = df_wb["period_dt"].dt.year
-            df_wb["month"]   = df_wb["period_dt"].dt.month
-            df_wb["quarter"] = df_wb["period_dt"].dt.quarter
-            df_wb = df_wb.drop_duplicates(subset=["period", "country"]).reset_index(drop=True)
-            out_wb = f"{clean_dir}/worldbank_combined.csv"
-            df_wb.to_csv(out_wb, index=False)
-            print(f"World Bank clean: {df_wb.shape} → {out_wb}")
+            # Konversi wide → long
+            df_long = df_wide.melt(
+                id_vars="period_raw",
+                value_vars=country_cols,
+                var_name="country_name",
+                value_name="value"
+            )
+
+            # Normalisasi format period
+            def parse_period(p):
+                """Konversi 2022M01 atau 2022.0 → YYYY-MM."""
+                p = str(p).strip()
+                if "M" in p:                          # format bulanan: 2022M01
+                    parts = p.split("M")
+                    return f"{parts[0]}-{parts[1].zfill(2)}"
+                else:                                  # format tahunan: 2022.0
+                    year = int(float(p))
+                    return f"{year}-01"               # forward-fill dilakukan di transform
+
+            df_long["period"] = df_long["period_raw"].apply(parse_period)
+
+            # Filter hanya 2022–2024
+            df_long = df_long[
+                df_long["period"].between("2022-01", "2024-12")
+            ].copy()
+
+            # Tambah kolom metadata
+            df_long["indicator"]     = indicator
+            df_long["country_code"]  = df_long["country_name"].map(COUNTRY_CODE_MAP)
+            df_long["value"]         = pd.to_numeric(df_long["value"], errors="coerce")
+
+            df_long = df_long.drop(columns=["period_raw"])
+            df_long = df_long.reset_index(drop=True)
+
+            out_path = str(STAGING_DIR / f"wb_{indicator}_2022_2024.csv")
+            df_long.to_csv(out_path, index=False)
+            saved_files.append(out_path)
+            log.info("✓ WB %-15s disimpan → %s  shape=%s",
+                     indicator, out_path, df_long.shape)
+
+        return ",".join(saved_files)
+
+    # =======================================================================
+    # TASK 2 — TRANSFORM: Bentuk Star Schema
+    # =======================================================================
+    @task(task_id="transform_all")
+    def transform_all(retail_path: str, gen_path: str, wb_paths: str) -> str:
+        """
+        Membaca semua staging CSV dan membangun:
+          Fact tables  : fact_energy_economy, fact_generation
+          Dim tables   : dim_time, dim_sector, dim_fuel_type, dim_country
+
+        Output disimpan ke clean/*.csv
+        Return: comma-separated list path file clean
+        """
+        CLEAN_DIR.mkdir(parents=True, exist_ok=True)
+
+        # -------------------------------------------------------------------
+        # Load staging files
+        # -------------------------------------------------------------------
+        df_retail = pd.read_csv(retail_path)
+        df_gen    = pd.read_csv(gen_path)
+        wb_files  = {p.split("wb_")[1].replace("_2022_2024.csv", ""): pd.read_csv(p)
+                     for p in wb_paths.split(",") if p}
+
+        # -------------------------------------------------------------------
+        # Transform EIA Retail
+        # -------------------------------------------------------------------
+        df_retail.columns = [c.strip() for c in df_retail.columns]
+
+        # Rename kolom ke snake_case
+        df_retail = df_retail.rename(columns={
+            "stateid":    "state_id",
+            "sectorid":   "sector_id",
+            "sectorName": "sector_name",
+            "sales":      "retail_sales_mwh",
+            "price":      "price_cents_kwh",
+            "revenue":    "revenue_million_usd",
+        })
+
+        # Filter US national only
+        if "state_id" in df_retail.columns:
+            df_retail = df_retail[df_retail["state_id"] == "US"].copy()
+
+        # Konversi numerik
+        for col in ["retail_sales_mwh", "price_cents_kwh", "revenue_million_usd"]:
+            if col in df_retail.columns:
+                df_retail[col] = pd.to_numeric(df_retail[col], errors="coerce")
+
+        # Normalisasi period
+        df_retail["period"]     = pd.to_datetime(df_retail["period"],
+                                                  format="%Y-%m", errors="coerce")
+        df_retail["year"]       = df_retail["period"].dt.year
+        df_retail["month"]      = df_retail["period"].dt.month
+        df_retail["quarter"]    = df_retail["period"].dt.quarter
+        df_retail["period_str"] = df_retail["period"].dt.strftime("%Y-%m")
+        df_retail = df_retail.dropna(subset=["period"]).drop_duplicates()
+
+        # -------------------------------------------------------------------
+        # Transform EIA Generation
+        # -------------------------------------------------------------------
+        df_gen.columns = [c.strip() for c in df_gen.columns]
+
+        df_gen = df_gen.rename(columns={
+            "location":            "location_id",
+            "sectorid":            "sector_id",
+            "fueltypeid":          "fuel_type_id",
+            "fuelTypeDescription": "fuel_description",
+            "generation":          "net_generation_mwh",
+        })
+
+        # Filter sektor 1 (Electric Power) saja
+        if "sector_id" in df_gen.columns:
+            df_gen["sector_id"] = pd.to_numeric(df_gen["sector_id"], errors="coerce")
+            df_gen = df_gen[df_gen["sector_id"] == 1].copy()
+
+        df_gen["net_generation_mwh"] = pd.to_numeric(
+            df_gen["net_generation_mwh"], errors="coerce"
+        )
+
+        # Tambah fuel metadata
+        df_gen["fuel_name"]     = df_gen["fuel_type_id"].map(
+            lambda x: FUEL_CATEGORY_MAP.get(x, ("Other", "Other", False))[0]
+        )
+        df_gen["fuel_category"] = df_gen["fuel_type_id"].map(
+            lambda x: FUEL_CATEGORY_MAP.get(x, ("Other", "Other", False))[1]
+        )
+        df_gen["is_renewable"]  = df_gen["fuel_type_id"].map(
+            lambda x: FUEL_CATEGORY_MAP.get(x, ("Other", "Other", False))[2]
+        )
+
+        df_gen["period"]     = pd.to_datetime(df_gen["period"],
+                                               format="%Y-%m", errors="coerce")
+        df_gen["year"]       = df_gen["period"].dt.year
+        df_gen["month"]      = df_gen["period"].dt.month
+        df_gen["quarter"]    = df_gen["period"].dt.quarter
+        df_gen["period_str"] = df_gen["period"].dt.strftime("%Y-%m")
+        df_gen = df_gen.dropna(subset=["period"]).drop_duplicates()
+
+        # -------------------------------------------------------------------
+        # Transform World Bank — pivot per indicator
+        # -------------------------------------------------------------------
+        wb_pivoted = {}
+        for indicator, df_wb in wb_files.items():
+            df_wb["value"] = pd.to_numeric(df_wb["value"], errors="coerce")
+            wb_pivoted[indicator] = df_wb.rename(columns={"value": indicator})
+
+        # Gabungkan semua WB indicator dalam satu DataFrame
+        # Base: semua kombinasi country × period dari CPI (paling lengkap)
+        if "cpi" in wb_pivoted:
+            df_wb_merged = wb_pivoted["cpi"][
+                ["period", "country_name", "country_code", "cpi"]
+            ].copy()
+
+            for ind in ["gdp", "industrial", "unemployment", "exchange_rate"]:
+                if ind in wb_pivoted:
+                    df_wb_merged = df_wb_merged.merge(
+                        wb_pivoted[ind][["period", "country_code", ind]],
+                        on=["period", "country_code"],
+                        how="left"
+                    )
+
+            # GDP hanya tahunan → forward fill per negara
+            if "gdp" in df_wb_merged.columns:
+                df_wb_merged = df_wb_merged.sort_values(
+                    ["country_code", "period"]
+                )
+                df_wb_merged["gdp"] = df_wb_merged.groupby("country_code")["gdp"].ffill()
         else:
-            print("World Bank file tidak tersedia")
+            # fallback: ambil file WB pertama yang ada
+            first_key = list(wb_pivoted.keys())[0]
+            df_wb_merged = wb_pivoted[first_key][
+                ["period", "country_name", "country_code"]
+            ].drop_duplicates()
 
-        # BUG 2 FIX: df_retail dan df_gen sudah pasti terdefinisi karena inisialisasi di atas
-        summary = {
-            "retail_rows"    : len(df_retail),
-            "generation_rows": len(df_gen),
-            "status"         : "OK",
+        # -------------------------------------------------------------------
+        # DIMENSI 1: dim_time
+        # -------------------------------------------------------------------
+        all_periods = pd.date_range("2022-01-01", "2024-12-01", freq="MS")
+        dim_time = pd.DataFrame({
+            "time_id":    range(1, len(all_periods) + 1),
+            "period":     all_periods.strftime("%Y-%m"),
+            "year":       all_periods.year,
+            "month":      all_periods.month,
+            "quarter":    all_periods.quarter,
+            "month_name": all_periods.strftime("%B"),
+        })
+
+        # -------------------------------------------------------------------
+        # DIMENSI 2: dim_sector
+        # -------------------------------------------------------------------
+        dim_sector = pd.DataFrame([
+            {"sector_id": "ALL", "sector_name": "All Sectors"},
+            {"sector_id": "RES", "sector_name": "Residential"},
+            {"sector_id": "COM", "sector_name": "Commercial"},
+            {"sector_id": "IND", "sector_name": "Industrial"},
+        ])
+
+        # -------------------------------------------------------------------
+        # DIMENSI 3: dim_fuel_type
+        # -------------------------------------------------------------------
+        dim_fuel_type = pd.DataFrame([
+            {
+                "fuel_id":        i + 1,
+                "fuel_type_id":   k,
+                "fuel_name":      v[0],
+                "fuel_category":  v[1],
+                "is_renewable":   v[2],
+            }
+            for i, (k, v) in enumerate(FUEL_CATEGORY_MAP.items())
+        ])
+
+        # -------------------------------------------------------------------
+        # DIMENSI 4: dim_country
+        # -------------------------------------------------------------------
+        region_map = {
+            "US": "North America", "CN": "Asia Pacific",
+            "DE": "Europe",        "JP": "Asia Pacific",
+            "IN": "Asia Pacific",  "GB": "Europe",
+            "FR": "Europe",        "BR": "South America",
         }
-        print(f"\nTRANSFORM selesai: {summary}")
-        return summary
+        income_map = {
+            "US": "High", "CN": "Upper-Middle", "DE": "High",
+            "JP": "High", "IN": "Lower-Middle",  "GB": "High",
+            "FR": "High", "BR": "Upper-Middle",
+        }
+        dim_country = pd.DataFrame([
+            {
+                "country_id":   i + 1,
+                "country_code": code,
+                "country_name": name,
+                "region":       region_map.get(code, "Unknown"),
+                "income_group": income_map.get(code, "Unknown"),
+            }
+            for i, (name, code) in enumerate(COUNTRY_CODE_MAP.items())
+        ])
 
-    # ══════════════════════════════════════
-    # LOAD — Supabase
-    # ══════════════════════════════════════
-    @task()
-    def load(summary: dict) -> None:
-        import pandas as pd, os
-        from sqlalchemy import create_engine, text
+        # -------------------------------------------------------------------
+        # FACT TABLE 1: fact_energy_economy
+        # Grain: period × sector × country
+        # -------------------------------------------------------------------
+        # Sisi EIA (US saja, tiap sektor)
+        df_eia_us = df_retail[["period_str", "sector_id",
+                                "price_cents_kwh", "retail_sales_mwh",
+                                "revenue_million_usd", "year"]].copy()
+        df_eia_us["country_code"] = "US"
 
-        print("=" * 50)
-        print("LOAD — mulai")
-        print(f"Summary dari transform: {summary}")
+        # Join dengan WB (US only)
+        df_wb_us = df_wb_merged[df_wb_merged["country_code"] == "US"].copy()
+        df_wb_us = df_wb_us.rename(columns={
+            "cpi":           "cpi_pct_yoy",
+            "gdp":           "gdp_current_usd_mn",
+            "industrial":    "industrial_prod_usd",
+            "unemployment":  "unemployment_rate",
+            "exchange_rate": "exchange_rate_lcu_usd",
+        })
 
-        DB_URL = "postgresql://postgres:RmpURVcO3LZM9hH6@db.wfcalipaqeflydixspxm.supabase.co:5432/postgres"
-        if not DB_URL:
-            print("SUPABASE_DB_URL tidak ditemukan — skip load")
-            return
+        fact_ee = df_eia_us.merge(
+            df_wb_us[["period", "cpi_pct_yoy", "gdp_current_usd_mn",
+                      "industrial_prod_usd", "unemployment_rate",
+                      "exchange_rate_lcu_usd"]],
+            left_on="period_str", right_on="period", how="left"
+        ).drop(columns=["period"], errors="ignore")
 
-        engine    = create_engine(DB_URL)
-        clean_dir = f"{STAGING}/clean"
+        # Tambah foreign keys
+        fact_ee = fact_ee.merge(
+            dim_time[["time_id", "period"]], left_on="period_str",
+            right_on="period", how="left"
+        ).drop(columns=["period"], errors="ignore")
 
-        retail_path = f"{clean_dir}/fact_retail.csv"
-        if os.path.exists(retail_path):
-            df   = pd.read_csv(retail_path)
-            cols = ["period", "year", "sector_id", "price_cents_kwh",
-                    "retail_sales_mwh", "revenue_million_usd"]
-            cols_ok = [c for c in cols if c in df.columns]
-            df[cols_ok].to_sql("fact_energy_economy", engine,
-                               if_exists="append", index=False, chunksize=500)
-            print(f"fact_energy_economy: {len(df)} rows")
+        fact_ee = fact_ee.rename(columns={"period_str": "period"})
 
-        gen_path = f"{clean_dir}/fact_generation.csv"
-        if os.path.exists(gen_path):
-            df   = pd.read_csv(gen_path)
-            cols = ["period", "year", "month", "quarter",
-                    "fuel_type_id", "fuel_name", "fuel_category",
-                    "is_renewable", "net_generation_mwh"]
-            cols_ok = [c for c in cols if c in df.columns]
-            df[cols_ok].to_sql("fact_generation", engine,
-                               if_exists="append", index=False, chunksize=500)
-            print(f"fact_generation: {len(df)} rows")
+        # Susun kolom akhir
+        fact_ee_cols = [
+            "period", "time_id", "sector_id", "country_code", "year",
+            "price_cents_kwh", "retail_sales_mwh", "revenue_million_usd",
+            "cpi_pct_yoy", "gdp_current_usd_mn",
+            "industrial_prod_usd", "unemployment_rate", "exchange_rate_lcu_usd",
+        ]
+        fact_ee = fact_ee[[c for c in fact_ee_cols if c in fact_ee.columns]]
+        fact_ee = fact_ee.drop_duplicates(
+            subset=["period", "sector_id", "country_code"]
+        ).reset_index(drop=True)
 
-        with engine.connect() as conn:
+        # -------------------------------------------------------------------
+        # FACT TABLE 2: fact_generation
+        # Grain: period × fuel_type
+        # -------------------------------------------------------------------
+        fact_gen = df_gen[[
+            "period_str", "fuel_type_id", "fuel_name",
+            "fuel_category", "is_renewable", "net_generation_mwh", "year"
+        ]].copy()
+
+        fact_gen = fact_gen.merge(
+            dim_time[["time_id", "period"]], left_on="period_str",
+            right_on="period", how="left"
+        ).drop(columns=["period"], errors="ignore")
+
+        fact_gen = fact_gen.rename(columns={"period_str": "period"})
+        fact_gen = fact_gen.drop_duplicates(
+            subset=["period", "fuel_type_id"]
+        ).reset_index(drop=True)
+
+        # -------------------------------------------------------------------
+        # Simpan semua tabel ke clean/
+        # -------------------------------------------------------------------
+        output_files = {
+            "dim_time":            dim_time,
+            "dim_sector":          dim_sector,
+            "dim_fuel_type":       dim_fuel_type,
+            "dim_country":         dim_country,
+            "fact_energy_economy": fact_ee,
+            "fact_generation":     fact_gen,
+        }
+
+        saved = []
+        for name, df in output_files.items():
+            path = str(CLEAN_DIR / f"{name}.csv")
+            df.to_csv(path, index=False)
+            saved.append(path)
+            log.info("✓ Transform %-22s → %s  shape=%s", name, path, df.shape)
+
+        log.info("Transform selesai. %d tabel tersimpan di %s", len(saved), CLEAN_DIR)
+        return ",".join(saved)
+
+    # =======================================================================
+    # TASK 3 — LOAD: Push ke Supabase dengan Idempotent Upsert
+    # =======================================================================
+    @task(task_id="load_to_supabase")
+    def load_to_supabase(clean_paths: str) -> str:
+        """
+        Load semua tabel clean ke Supabase PostgreSQL.
+
+        Strategi IDEMPOTENT (tidak duplikasi data):
+          - Dimensi  : INSERT ... ON CONFLICT (PK) DO UPDATE (upsert)
+          - Fact EE  : DELETE rows WHERE period IN (list periode yg akan di-load)
+                       lalu INSERT fresh
+          - Fact Gen : sama seperti Fact EE
+
+        Connection: SUPABASE_DB_URL dari environment (~/.bashrc server)
+        """
+        db_url = os.environ.get("SUPABASE_DB_URL", "")
+        if not db_url:
+            raise EnvironmentError(
+                "SUPABASE_DB_URL tidak ditemukan. "
+                "Jalankan: source ~/.bashrc"
+            )
+
+        engine = create_engine(db_url, pool_pre_ping=True)
+
+        # Baca semua file clean
+        tables = {}
+        for path in clean_paths.split(","):
+            if not path:
+                continue
+            name = Path(path).stem          # misal: "fact_energy_economy"
+            tables[name] = pd.read_csv(path)
+            log.info("Load: membaca %s  shape=%s", name, tables[name].shape)
+
+        with engine.begin() as conn:
+
+            # ---------------------------------------------------------------
+            # DDL — buat tabel jika belum ada
+            # ---------------------------------------------------------------
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dim_time (
+                    time_id    INTEGER PRIMARY KEY,
+                    period     VARCHAR(7)  NOT NULL,
+                    year       INTEGER,
+                    month      INTEGER,
+                    quarter    INTEGER,
+                    month_name VARCHAR(20)
+                );
+            """))
+
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dim_sector (
+                    sector_id   VARCHAR(5) PRIMARY KEY,
+                    sector_name VARCHAR(50)
+                );
+            """))
+
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dim_fuel_type (
+                    fuel_id       SERIAL PRIMARY KEY,
+                    fuel_type_id  VARCHAR(5)  UNIQUE NOT NULL,
+                    fuel_name     VARCHAR(50),
+                    fuel_category VARCHAR(20),
+                    is_renewable  BOOLEAN
+                );
+            """))
+
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dim_country (
+                    country_id   SERIAL PRIMARY KEY,
+                    country_code VARCHAR(3)  UNIQUE NOT NULL,
+                    country_name VARCHAR(50),
+                    region       VARCHAR(50),
+                    income_group VARCHAR(20)
+                );
+            """))
+
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS fact_energy_economy (
+                    period                  VARCHAR(7)  NOT NULL,
+                    time_id                 INTEGER,
+                    sector_id               VARCHAR(5)  NOT NULL,
+                    country_code            VARCHAR(3)  NOT NULL,
+                    year                    INTEGER,
+                    price_cents_kwh         FLOAT,
+                    retail_sales_mwh        FLOAT,
+                    revenue_million_usd     FLOAT,
+                    cpi_pct_yoy             FLOAT,
+                    gdp_current_usd_mn      FLOAT,
+                    industrial_prod_usd     FLOAT,
+                    unemployment_rate       FLOAT,
+                    exchange_rate_lcu_usd   FLOAT,
+                    PRIMARY KEY (period, sector_id, country_code)
+                );
+            """))
+
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS fact_generation (
+                    period              VARCHAR(7)  NOT NULL,
+                    time_id             INTEGER,
+                    fuel_type_id        VARCHAR(5)  NOT NULL,
+                    fuel_name           VARCHAR(50),
+                    fuel_category       VARCHAR(20),
+                    is_renewable        BOOLEAN,
+                    net_generation_mwh  FLOAT,
+                    year                INTEGER,
+                    PRIMARY KEY (period, fuel_type_id)
+                );
+            """))
+
+            # ---------------------------------------------------------------
+            # UPSERT: dim_time
+            # ---------------------------------------------------------------
+            if "dim_time" in tables:
+                for _, row in tables["dim_time"].iterrows():
+                    conn.execute(text("""
+                        INSERT INTO dim_time
+                            (time_id, period, year, month, quarter, month_name)
+                        VALUES
+                            (:time_id, :period, :year, :month, :quarter, :month_name)
+                        ON CONFLICT (time_id) DO UPDATE SET
+                            period     = EXCLUDED.period,
+                            year       = EXCLUDED.year,
+                            month      = EXCLUDED.month,
+                            quarter    = EXCLUDED.quarter,
+                            month_name = EXCLUDED.month_name;
+                    """), row.to_dict())
+                log.info("✓ dim_time loaded: %d rows", len(tables["dim_time"]))
+
+            # ---------------------------------------------------------------
+            # UPSERT: dim_sector
+            # ---------------------------------------------------------------
+            if "dim_sector" in tables:
+                for _, row in tables["dim_sector"].iterrows():
+                    conn.execute(text("""
+                        INSERT INTO dim_sector (sector_id, sector_name)
+                        VALUES (:sector_id, :sector_name)
+                        ON CONFLICT (sector_id) DO UPDATE SET
+                            sector_name = EXCLUDED.sector_name;
+                    """), row.to_dict())
+                log.info("✓ dim_sector loaded: %d rows", len(tables["dim_sector"]))
+
+            # ---------------------------------------------------------------
+            # UPSERT: dim_fuel_type
+            # ---------------------------------------------------------------
+            if "dim_fuel_type" in tables:
+                for _, row in tables["dim_fuel_type"].iterrows():
+                    conn.execute(text("""
+                        INSERT INTO dim_fuel_type
+                            (fuel_type_id, fuel_name, fuel_category, is_renewable)
+                        VALUES
+                            (:fuel_type_id, :fuel_name, :fuel_category, :is_renewable)
+                        ON CONFLICT (fuel_type_id) DO UPDATE SET
+                            fuel_name     = EXCLUDED.fuel_name,
+                            fuel_category = EXCLUDED.fuel_category,
+                            is_renewable  = EXCLUDED.is_renewable;
+                    """), row.to_dict())
+                log.info("✓ dim_fuel_type loaded: %d rows", len(tables["dim_fuel_type"]))
+
+            # ---------------------------------------------------------------
+            # UPSERT: dim_country
+            # ---------------------------------------------------------------
+            if "dim_country" in tables:
+                for _, row in tables["dim_country"].iterrows():
+                    conn.execute(text("""
+                        INSERT INTO dim_country
+                            (country_code, country_name, region, income_group)
+                        VALUES
+                            (:country_code, :country_name, :region, :income_group)
+                        ON CONFLICT (country_code) DO UPDATE SET
+                            country_name = EXCLUDED.country_name,
+                            region       = EXCLUDED.region,
+                            income_group = EXCLUDED.income_group;
+                    """), row.to_dict())
+                log.info("✓ dim_country loaded: %d rows", len(tables["dim_country"]))
+
+            # ---------------------------------------------------------------
+            # IDEMPOTENT: fact_energy_economy
+            # Hapus periode yang akan di-load, lalu insert ulang
+            # ---------------------------------------------------------------
+            if "fact_energy_economy" in tables:
+                df_fee = tables["fact_energy_economy"]
+                periods = df_fee["period"].dropna().unique().tolist()
+                if periods:
+                    # Hapus data lama untuk periode yang sama
+                    conn.execute(text("""
+                        DELETE FROM fact_energy_economy
+                        WHERE period = ANY(:periods)
+                    """), {"periods": periods})
+
+                    # Insert fresh
+                    df_fee_clean = df_fee.where(pd.notnull(df_fee), None)
+                    df_fee_clean.to_sql(
+                        "fact_energy_economy",
+                        conn,
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                        chunksize=500,
+                    )
+                log.info("✓ fact_energy_economy loaded: %d rows", len(df_fee))
+
+            # ---------------------------------------------------------------
+            # IDEMPOTENT: fact_generation
+            # ---------------------------------------------------------------
+            if "fact_generation" in tables:
+                df_fgen = tables["fact_generation"]
+                periods = df_fgen["period"].dropna().unique().tolist()
+                if periods:
+                    conn.execute(text("""
+                        DELETE FROM fact_generation
+                        WHERE period = ANY(:periods)
+                    """), {"periods": periods})
+
+                    df_fgen_clean = df_fgen.where(pd.notnull(df_fgen), None)
+                    df_fgen_clean.to_sql(
+                        "fact_generation",
+                        conn,
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                        chunksize=500,
+                    )
+                log.info("✓ fact_generation loaded: %d rows", len(df_fgen))
+
+        log.info("=== LOAD KE SUPABASE SELESAI ===")
+        return "load_success"
+
+    # =======================================================================
+    # TASK 4 — REFRESH Materialized Views
+    # =======================================================================
+    @task(task_id="refresh_materialized_views")
+    def refresh_materialized_views(load_status: str) -> str:
+        """
+        Buat Materialized View jika belum ada, lalu refresh.
+        Views:
+          - mv_generation_monthly  : total generasi bulanan per fuel
+          - mv_retail_economic     : harga listrik vs CPI bulanan
+        """
+        if load_status != "load_success":
+            log.warning("Load tidak sukses, skip refresh views.")
+            return "skipped"
+
+        db_url = os.environ.get("SUPABASE_DB_URL", "")
+        if not db_url:
+            raise EnvironmentError("SUPABASE_DB_URL tidak ditemukan.")
+
+        engine = create_engine(db_url, pool_pre_ping=True)
+
+        # -------------------------------------------------------------------
+        # Koneksi 1: DDL — buat MV dan index (pakai begin/commit biasa)
+        # -------------------------------------------------------------------
+        with engine.begin() as conn:
+
+            # Aktifkan extension pg_stat_statements
             try:
-                conn.execute(text("REFRESH MATERIALIZED VIEW mv_generation_monthly"))
-                conn.execute(text("REFRESH MATERIALIZED VIEW mv_retail_economic"))
-                conn.commit()
-                print("Materialized Views di-refresh")
+                conn.execute(text(
+                    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+                ))
+                log.info("✓ pg_stat_statements extension OK")
             except Exception as e:
-                print(f"Refresh MV: {e}")
+                log.warning("pg_stat_statements: %s", e)
 
-    # ══════════════════════════════════════
-    # NOTIFY
-    # ══════════════════════════════════════
-    notify = BashOperator(
-        task_id     = "notify_completion",
-        bash_command= 'echo "Pipeline energy_economy_etl_int24 selesai: $(date)"',
+            # MV 1: mv_generation_monthly
+            conn.execute(text("""
+                CREATE MATERIALIZED VIEW IF NOT EXISTS mv_generation_monthly AS
+                SELECT
+                    fg.period,
+                    fg.year,
+                    dt.quarter,
+                    fg.fuel_type_id,
+                    fg.fuel_name,
+                    fg.fuel_category,
+                    fg.is_renewable,
+                    SUM(fg.net_generation_mwh) AS total_generation_mwh,
+                    COUNT(*)                   AS record_count
+                FROM fact_generation fg
+                LEFT JOIN dim_time dt ON fg.period = dt.period
+                GROUP BY
+                    fg.period, fg.year, dt.quarter,
+                    fg.fuel_type_id, fg.fuel_name,
+                    fg.fuel_category, fg.is_renewable
+                ORDER BY fg.period, fg.fuel_type_id;
+            """))
+            log.info("✓ mv_generation_monthly: DDL OK")
+
+            # MV 2: mv_retail_economic
+            conn.execute(text("""
+                CREATE MATERIALIZED VIEW IF NOT EXISTS mv_retail_economic AS
+                SELECT
+                    fee.period,
+                    fee.year,
+                    dt.quarter,
+                    fee.sector_id,
+                    ds.sector_name,
+                    AVG(fee.price_cents_kwh)       AS avg_price_cents_kwh,
+                    SUM(fee.retail_sales_mwh)      AS total_sales_mwh,
+                    SUM(fee.revenue_million_usd)   AS total_revenue_usd_mn,
+                    AVG(fee.cpi_pct_yoy)           AS avg_cpi_pct_yoy,
+                    AVG(fee.gdp_current_usd_mn)    AS avg_gdp_usd_mn,
+                    AVG(fee.unemployment_rate)     AS avg_unemployment_rate
+                FROM fact_energy_economy fee
+                LEFT JOIN dim_time   dt ON fee.period    = dt.period
+                LEFT JOIN dim_sector ds ON fee.sector_id = ds.sector_id
+                GROUP BY
+                    fee.period, fee.year, dt.quarter,
+                    fee.sector_id, ds.sector_name
+                ORDER BY fee.period, fee.sector_id;
+            """))
+            log.info("✓ mv_retail_economic: DDL OK")
+
+            # Index untuk performa OLAP
+            try:
+                conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_fee_period
+                        ON fact_energy_economy (period);
+                    CREATE INDEX IF NOT EXISTS idx_fee_sector
+                        ON fact_energy_economy (sector_id);
+                    CREATE INDEX IF NOT EXISTS idx_fgen_period
+                        ON fact_generation (period);
+                    CREATE INDEX IF NOT EXISTS idx_fgen_fuel
+                        ON fact_generation (fuel_type_id);
+                """))
+                log.info("✓ Index berhasil dibuat/diverifikasi")
+            except Exception as e:
+                log.warning("Index creation: %s", e)
+
+        # -------------------------------------------------------------------
+        # Koneksi 2: REFRESH MV — wajib pakai AUTOCOMMIT
+        # REFRESH tidak boleh dijalankan dalam transaction block
+        # -------------------------------------------------------------------
+        with engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as conn2:
+            conn2.execute(text(
+                "REFRESH MATERIALIZED VIEW mv_generation_monthly;"
+            ))
+            log.info("✓ mv_generation_monthly: REFRESHED")
+
+        with engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as conn3:
+            conn3.execute(text(
+                "REFRESH MATERIALIZED VIEW mv_retail_economic;"
+            ))
+            log.info("✓ mv_retail_economic: REFRESHED")
+
+        log.info("=== REFRESH MATERIALIZED VIEWS SELESAI ===")
+        return "refresh_success"
+
+    # =======================================================================
+    # DEPENDENCY GRAPH
+    # =======================================================================
+    # Task instance
+    t_retail  = extract_eia_retail()
+    t_gen     = extract_eia_generation()
+    t_wb      = extract_worldbank()
+
+    # Transform menunggu ketiga extract selesai
+    t_transform = transform_all(
+        retail_path=t_retail,
+        gen_path=t_gen,
+        wb_paths=t_wb
     )
 
-    retail = extract_eia()
-    gen    = extract_eia_generation()
-    wb     = extract_worldbank()
-    result = transform(retail, gen, wb)
-    load(result) >> notify
+    # Load menunggu transform selesai
+    t_load = load_to_supabase(clean_paths=t_transform)
 
-energy_economy_pipeline()
+    # Refresh views menunggu load selesai
+    refresh_materialized_views(load_status=t_load)
+
+
+# Instansiasi DAG
+energy_economy_etl()
