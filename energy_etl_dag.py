@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta
 from airflow.decorators import dag, task
-from airflow.operators.bash import BashOperator
+from airflow.operators.bash import BashOperator # type: ignore
+import pandas as pd
 
-# ── Konstanta path — di luar @dag agar selalu tersedia di worker
 STAGING  = "/home/inter24/energy_dwh/staging"
 RAW_DIR  = "/home/inter24/energy_dwh/raw"
+EIA_API_KEY= "0aWq1mZQy2eQk9Cg2E9u7F8BrEBovNevmmfxgHKc"
 
 default_args = {
     "owner"          : "inter24",
@@ -31,7 +32,7 @@ def energy_economy_pipeline():
     def extract_eia() -> str:
         import requests, os, pandas as pd
 
-        API_KEY = os.getenv("EIA_API_KEY", "")
+        API_KEY = EIA_API_KEY
         os.makedirs(STAGING, exist_ok=True)
 
         url    = "  "
@@ -62,9 +63,9 @@ def energy_economy_pipeline():
     # ══════════════════════════════════════
     @task()
     def extract_eia_generation() -> str:
-        import requests, os, pandas as pd
+        import requests, os, pandas as pdq
 
-        API_KEY = os.getenv("EIA_API_KEY", "")
+        API_KEY = EIA_API_KEY
         os.makedirs(STAGING, exist_ok=True)
 
         url    = "https://api.eia.gov/v2/electricity/electric-power-operational-data/data"
@@ -270,7 +271,7 @@ def energy_economy_pipeline():
         print("LOAD — mulai")
         print(f"Summary dari transform: {summary}")
 
-        DB_URL = os.getenv("SUPABASE_DB_URL", "")
+        DB_URL = "postgresql://postgres:RmpURVcO3LZM9hH6@db.wfcalipaqeflydixspxm.supabase.co:5432/postgres"
         if not DB_URL:
             print("SUPABASE_DB_URL tidak ditemukan — skip load")
             return
