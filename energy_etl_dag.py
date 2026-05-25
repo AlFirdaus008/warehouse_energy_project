@@ -565,18 +565,117 @@ def energy_economy_etl():
             subset=["period", "fuel_type_id"]
         ).reset_index(drop=True)
 
+        wb_files_raw = {
+            "cpi":           pd.read_csv(str(STAGING_DIR / "wb_cpi_2022_2024.csv")),
+            "industrial":    pd.read_csv(str(STAGING_DIR / "wb_industrial_2022_2024.csv")),
+            "exchange_rate": pd.read_csv(str(STAGING_DIR / "wb_exchange_rate_2022_2024.csv")),
+            "unemployment":  pd.read_csv(str(STAGING_DIR / "wb_unemployment_2022_2024.csv")),
+            "gdp":           pd.read_csv(str(STAGING_DIR / "wb_gdp_2022_2024.csv")),
+        }
+
+        # Buat base: semua kombinasi period × country dari CPI (paling lengkap)
+        df_base = wb_files_raw["cpi"][["period", "country_code", "country_name"]].copy()
+        df_base = df_base.rename(columns={"value": "cpi_pct_yoy"})
+
+        # Merge CPI
+        df_wb_all = wb_files_raw["cpi"][["period", "country_code", "value"]].rename(
+            columns={"value": "cpi_pct_yoy"}
+        )
+
+        # Merge Industrial Production
+        df_wb_all = df_wb_all.merge(
+            wb_files_raw["industrial"][["period", "country_code", "value"]].rename(
+                columns={"value": "industrial_prod_usd"}
+            ),
+            on=["period", "country_code"], how="left"
+        )
+
+        # Merge Exchange Rate
+        df_wb_all = df_wb_all.merge(
+            wb_files_raw["exchange_rate"][["period", "country_code", "value"]].rename(
+                columns={"value": "exchange_rate_lcu_usd"}
+            ),
+            on=["period", "country_code"], how="left"
+        )
+
+        # Merge Unemployment (hanya 6 negara, sisanya NaN)
+        df_wb_all = df_wb_all.merge(
+            wb_files_raw["unemployment"][["period", "country_code", "value"]].rename(
+                columns={"value": "unemployment_rate"}
+            ),
+            on=["period", "country_code"], how="left"
+        )
+
+        # Merge GDP — forward fill dari annual ke monthly per negara
+        df_gdp = wb_files_raw["gdp"][["period", "country_code", "value"]].rename(
+            columns={"value": "gdp_current_usd_mn"}
+        )
+        # GDP period format: "2022-01" (hasil parse dari "2022.0")
+        # Expand ke semua 36 bulan per negara dengan forward fill
+        all_periods  = pd.date_range("2022-01-01", "2024-12-01", freq="MS")
+        all_periods_str = [p.strftime("%Y-%m") for p in all_periods]
+        country_codes   = df_wb_all["country_code"].unique().tolist()
+
+        # Buat grid lengkap period × country
+        df_grid = pd.DataFrame([
+            {"period": p, "country_code": c}
+            for p in all_periods_str
+            for c in country_codes
+        ])
+
+        # Join GDP ke grid lalu forward fill
+        df_gdp_expanded = df_grid.merge(df_gdp, on=["period", "country_code"], how="left")
+        df_gdp_expanded = df_gdp_expanded.sort_values(["country_code", "period"])
+        df_gdp_expanded["gdp_current_usd_mn"] = df_gdp_expanded.groupby(
+            "country_code"
+        )["gdp_current_usd_mn"].ffill()
+
+        # Merge GDP yang sudah di-forward-fill
+        df_wb_all = df_wb_all.merge(
+            df_gdp_expanded[["period", "country_code", "gdp_current_usd_mn"]],
+            on=["period", "country_code"], how="left"
+        )
+
+        # Tambah kolom metadata
+        df_wb_all["year"]    = df_wb_all["period"].str[:4].astype(int)
+        df_wb_all["month"]   = df_wb_all["period"].str[5:7].astype(int)
+        df_wb_all["quarter"] = ((df_wb_all["month"] - 1) // 3 + 1).astype(int)
+
+        # Tambah country_name dari mapping
+        country_name_map = {
+            "US": "United States", "CN": "China",
+            "DE": "Germany",       "JP": "Japan",
+            "IN": "India",         "GB": "United Kingdom",
+            "FR": "France",        "BR": "Brazil"
+        }
+        df_wb_all["country_name"] = df_wb_all["country_code"].map(country_name_map)
+
+        # Susun kolom final
+        df_wb_all = df_wb_all[[
+            "period", "year", "quarter", "month",
+            "country_code", "country_name",
+            "cpi_pct_yoy", "industrial_prod_usd",
+            "exchange_rate_lcu_usd", "unemployment_rate",
+            "gdp_current_usd_mn"
+        ]].drop_duplicates(
+            subset=["period", "country_code"]
+        ).reset_index(drop=True)
+
+        log.info("fact_worldbank_indicators shape=%s", df_wb_all.shape)
+
         # -------------------------------------------------------------------
         # Simpan semua tabel ke clean/
         # -------------------------------------------------------------------
         output_files = {
-            "dim_time":            dim_time,
-            "dim_sector":          dim_sector,
-            "dim_fuel_type":       dim_fuel_type,
-            "dim_country":         dim_country,
-            "fact_energy_economy": fact_ee,
-            "fact_generation":     fact_gen,
+        "dim_time":                   dim_time,
+        "dim_sector":                 dim_sector,
+        "dim_fuel_type":              dim_fuel_type,
+        "dim_country":                dim_country,
+        "fact_energy_economy":        fact_ee,
+        "fact_generation":            fact_gen,
+        "fact_worldbank_indicators":  df_wb_all,
         }
-
+        
         saved = []
         for name, df in output_files.items():
             path = str(CLEAN_DIR / f"{name}.csv")
@@ -697,6 +796,23 @@ def energy_economy_etl():
                 );
             """))
 
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS fact_worldbank_indicators (
+                    period                  VARCHAR(7)   NOT NULL,
+                    year                    INTEGER,
+                    quarter                 INTEGER,
+                    month                   INTEGER,
+                    country_code            VARCHAR(3)   NOT NULL,
+                    country_name            VARCHAR(50),
+                    cpi_pct_yoy             FLOAT,
+                    industrial_prod_usd     FLOAT,
+                    exchange_rate_lcu_usd   FLOAT,
+                    unemployment_rate       FLOAT,
+                    gdp_current_usd_mn      FLOAT,
+                    PRIMARY KEY (period, country_code)
+                );
+            """))
+
             # ---------------------------------------------------------------
             # UPSERT: dim_time
             # ---------------------------------------------------------------
@@ -811,6 +927,29 @@ def energy_economy_etl():
                         chunksize=500,
                     )
                 log.info("✓ fact_generation loaded: %d rows", len(df_fgen))
+
+            # ---------------------------------------------------------------
+            # IDEMPOTENT: fact_worldbank_indicators
+            # ---------------------------------------------------------------
+            if "fact_worldbank_indicators" in tables:
+                df_fwb  = tables["fact_worldbank_indicators"]
+                periods = df_fwb["period"].dropna().unique().tolist()
+                if periods:
+                    conn.execute(text("""
+                        DELETE FROM fact_worldbank_indicators
+                        WHERE period = ANY(:periods)
+                    """), {"periods": periods})
+
+                    df_fwb_clean = df_fwb.where(pd.notnull(df_fwb), None)
+                    df_fwb_clean.to_sql(
+                        "fact_worldbank_indicators",
+                        conn,
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                        chunksize=500,
+                    )
+                log.info("fact_worldbank_indicators loaded: %d rows", len(df_fwb))
 
         log.info("=== LOAD KE SUPABASE SELESAI ===")
         return "load_success"
