@@ -67,7 +67,7 @@ log = logging.getLogger(__name__)
         "ETL Pipeline: EIA Electricity API + World Bank CSV → "
         "Transform Star Schema → Load Supabase PostgreSQL"
     ),
-    schedule=timedelta(minutes=5),
+    schedule=timedelta(minutes=30),
     start_date=datetime(2025, 5, 19),
     catchup=False,
     max_active_runs=1,
